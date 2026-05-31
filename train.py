@@ -22,7 +22,10 @@ Usage
     python train.py
 
     # override anything via CLI
-    python train.py --epochs 25 --batch-size 4 --lr 0.005
+    python train.py --epochs 40 --batch-size 4 --lr 0.005
+
+    # resume from the last saved checkpoint (picks up where you left off)
+    python train.py --resume --epochs 40
 
 Requirements
 ------------
@@ -65,14 +68,13 @@ from baseball_dataset import (
 @dataclass
 class Config:
     dataset_dir: str = "dataset"
-    output_dir: str = "runs/run1"
+    output_dir: str = "runs/run2"
 
-    num_classes: int = 2          # background + baseball
-
-    epochs: int = 20
-    batch_size: int = 2           # small images per GPU; detection batches stay tiny
-    num_workers: int = 2
-    lr: float = 0.005
+    num_classes: int = 2         # background + baseball
+    epochs: int = 40
+    batch_size: int = 2
+    num_workers: int = 0
+    lr: float = 0.003
     momentum: float = 0.9
     weight_decay: float = 0.0005
     lr_step_size: int = 8
@@ -85,12 +87,16 @@ class Config:
     )
     anchor_ratios: Tuple[float, ...] = (0.5, 1.0, 2.0)
 
-    # Pretrained weights. Set to None to train from random init (don't).
+    # Pretrained weights. Set to False to train from random init (don't).
     pretrained: bool = True
 
     # Eval threshold for the simple IoU-based precision/recall logger
     eval_iou_threshold: float = 0.5
-    eval_score_threshold: float = 0.05
+    # original 0.05
+    eval_score_threshold: float = 0.3
+
+    # Resume from last checkpoint instead of starting fresh
+    resume: bool = False
 
 
 # -----------------------------------------------------------------
@@ -113,8 +119,6 @@ def build_model(cfg: Config) -> torch.nn.Module:
     model = fasterrcnn_resnet50_fpn(
         weights=weights,
         rpn_anchor_generator=anchor_generator,
-        # Smaller min_size helps if frames come in small; we already
-        # standardize upstream, so leave the default.
     )
 
     # Replace the classification head: default has 91 COCO classes.
@@ -122,6 +126,33 @@ def build_model(cfg: Config) -> torch.nn.Module:
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, cfg.num_classes)
 
     return model
+
+
+# -----------------------------------------------------------------
+#  RESUME HELPER
+# -----------------------------------------------------------------
+
+
+def find_latest_checkpoint(output_dir: str):
+    """
+    Scan output_dir for epoch_XXX.pt files and return the path to the
+    most recent one, plus the epoch number. Returns (None, 0) if none found.
+    """
+    if not os.path.isdir(output_dir):
+        return None, 0
+
+    checkpoints = sorted([
+        f for f in os.listdir(output_dir)
+        if f.startswith("epoch_") and f.endswith(".pt")
+    ])
+
+    if not checkpoints:
+        return None, 0
+
+    latest = checkpoints[-1]
+    # Parse epoch number from filename e.g. epoch_020.pt -> 20
+    epoch_num = int(latest.replace("epoch_", "").replace(".pt", ""))
+    return os.path.join(output_dir, latest), epoch_num
 
 
 # -----------------------------------------------------------------
@@ -154,9 +185,10 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
 
+        # .detach() removes gradient tracking before converting to float
         for k, v in loss_dict.items():
-            running[k] = running.get(k, 0.0) + float(v)
-        running["total"] = running.get("total", 0.0) + float(loss)
+            running[k] = running.get(k, 0.0) + float(v.detach())
+        running["total"] = running.get("total", 0.0) + float(loss.detach())
         n_batches += 1
 
         if (i + 1) % print_every == 0:
@@ -187,8 +219,7 @@ def evaluate(
 ) -> Dict[str, float]:
     """
     Lightweight eval: sweep predictions at one IoU threshold, compute
-    precision / recall / F1 at the given score threshold. Not as
-    thorough as COCO mAP, but zero extra dependencies and easy to read.
+    precision / recall / F1 at the given score threshold.
     """
     model.eval()
     tp = fp = fn = 0
@@ -198,7 +229,6 @@ def evaluate(
         outputs = model(images)
 
         for output, target in zip(outputs, targets):
-            # Filter predictions by score
             keep = output["scores"] >= score_threshold
             pred_boxes = output["boxes"][keep].cpu()
             gt_boxes = target["boxes"]
@@ -213,7 +243,6 @@ def evaluate(
                 continue
 
             iou = _box_iou(pred_boxes, gt_boxes)
-            # Greedy matching: highest-IoU pred claims each GT at most once
             matched_gt = set()
             for pi in torch.argsort(-output["scores"][keep]):
                 ious_for_pi = iou[pi]
@@ -271,23 +300,46 @@ def main(cfg: Config) -> None:
     else:
         print("No val split found — training without validation.")
 
+    # Build model — always start from pretrained COCO weights so the
+    # architecture is initialized correctly before we load our checkpoint.
     model = build_model(cfg).to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = SGD(params, lr=cfg.lr, momentum=cfg.momentum,
                     weight_decay=cfg.weight_decay)
     scheduler = StepLR(optimizer, step_size=cfg.lr_step_size, gamma=cfg.lr_gamma)
 
+    # Resume: load the latest checkpoint and fast-forward the scheduler
+    start_epoch = 1
+    best_f1 = -1.0
+    best_loss = float("inf")
+
+    if cfg.resume:
+        ckpt_path, last_epoch = find_latest_checkpoint(cfg.output_dir)
+        if ckpt_path is None:
+            print("No checkpoint found — starting from scratch.")
+        else:
+            print(f"Resuming from: {ckpt_path} (epoch {last_epoch})")
+            ckpt = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            # Fast-forward the LR scheduler to match where we left off
+            for _ in range(last_epoch):
+                scheduler.step()
+            start_epoch = last_epoch + 1
+            print(f"Resuming training from epoch {start_epoch}\n")
+
     log_path = os.path.join(cfg.output_dir, "training_log.csv")
     log_fields = ["epoch", "total_loss", "loss_classifier", "loss_box_reg",
                   "loss_objectness", "loss_rpn_box_reg", "epoch_time_s",
                   "val_precision", "val_recall", "val_f1"]
-    with open(log_path, "w", newline="") as f:
-        csv.DictWriter(f, fieldnames=log_fields).writeheader()
 
-    best_f1 = -1.0
-    best_loss = float("inf")
+    # If resuming, append to existing log. Otherwise start fresh.
+    log_mode = "a" if cfg.resume and os.path.isfile(log_path) else "w"
+    with open(log_path, log_mode, newline="") as f:
+        if log_mode == "w":
+            csv.DictWriter(f, fieldnames=log_fields).writeheader()
 
-    for epoch in range(1, cfg.epochs + 1):
+    for epoch in range(start_epoch, cfg.epochs + 1):
         print(f"\n=== Epoch {epoch}/{cfg.epochs} ===")
         tmean = train_one_epoch(model, train_loader, optimizer, device, epoch)
         scheduler.step()
@@ -356,6 +408,8 @@ def parse_args() -> Config:
     p.add_argument("--lr",          type=float, default=Config.lr)
     p.add_argument("--no-pretrained", action="store_true",
                    help="Disable COCO pretrained weights")
+    p.add_argument("--resume", action="store_true",
+                   help="Resume training from the latest checkpoint in output-dir")
     a = p.parse_args()
     cfg = Config()
     cfg.dataset_dir = a.dataset_dir
@@ -365,6 +419,7 @@ def parse_args() -> Config:
     cfg.num_workers = a.num_workers
     cfg.lr = a.lr
     cfg.pretrained = not a.no_pretrained
+    cfg.resume = a.resume
     return cfg
 
 
